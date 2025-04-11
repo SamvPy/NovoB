@@ -1,4 +1,5 @@
 import tensorflow as tf
+from tensorflow.keras import mixed_precision
 import sys
 import time
 import numpy as np
@@ -8,22 +9,38 @@ import argparse
 import os
 from absl import logging
 
+# Use the tensor cores
+mixed_precision.set_global_policy('mixed_float16')
+
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 logging.set_verbosity(logging.ERROR)
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+
+MEMORY_LIMIT = 8000 # MiB
+gpus = tf.config.list_physical_devices('GPU')
+
+if len(gpus) > 1:
+    gpu_i = 1
+else:
+    gpu_i = 0
+tf.config.set_visible_devices(gpus[gpu_i], 'GPU')
+tf.config.set_logical_device_configuration(
+    gpus[gpu_i], 
+    [tf.config.LogicalDeviceConfiguration(memory_limit=MEMORY_LIMIT)])
 
 Proton = 1.007276035
 H2O = 18.0105647
 B_ION_OFFSET = Proton
 Y_ION_OFFSET = H2O + Proton
 RESOLUTION = 1000 # Max = 1000
-MAXPEPTMASS = 3000
+MAXPEPTMASS = 5000
 
 # ## Traning Data Generation
 BATCH_SIZE = 128
 BUFFER_SIZE = 3500000
 SPECTRA_MAX_LENGTH = 1010
-PEPTIDE_MAX_LENGTH = 55
+PEPTIDE_MAX_LENGTH = 50
 
 amino2idx = {'<pad>': 0, '<bos>': 1, '<eos>': 2,
              'A': 3, 'C': 4, 'D': 5, 'E': 6, 'F': 7,
@@ -50,8 +67,7 @@ idx2mass = {0: 0.00, 1: 0.00, 2: 0.00,
              23: 147.035, 24: 115.027, 25: 129.043, 26: 166.998, 27: 181.014, 28:243.030}
 
 def tf_encode(pt):
-    pt.set_shape([None, 2])
-    pt = {'inp' : pt}
+    pt['inp'].set_shape([None, 2])
     return pt
 
 
@@ -67,6 +83,8 @@ def test_data_generator(test_file) :
         inten = spec['intensity array']
         mz = spec['m/z array']
         
+        scan_id = spec["params"]["scans"]
+
         if pmass > MAXPEPTMASS or len(mz) > 1000 :
             continue
 
@@ -107,7 +125,7 @@ def test_data_generator(test_file) :
         peak_int = int(float(yion)*RESOLUTION)
         peaklist.append([peak_int, 102])
 
-        yield peaklist
+        yield {'inp': peaklist, 'scan_id': scan_id}
 
 def filter_max_length(x, sepc_max_length=SPECTRA_MAX_LENGTH):
     return tf.logical_and(tf.size(x['inp'][:, :1]) <= sepc_max_length, True)
@@ -298,6 +316,7 @@ def translate(result):
 
 def main(args) :
     BATCH_SIZE = args.batch_size
+
     if not args.no_multigpu :
         if args.no_nccl :
             strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.HierarchicalCopyAllReduce())
@@ -308,8 +327,13 @@ def main(args) :
         options = tf.data.Options()
         options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
 
-    spec_data = tf.data.Dataset.from_generator(test_data_generator, output_types=(tf.int64),
-                                               output_shapes =( (None, 2) ), args=([args.spectrum_file]) )
+    spec_data = tf.data.Dataset.from_generator(
+        test_data_generator, 
+        output_types={'inp': tf.int64, 'scan_id': tf.string},
+        output_shapes={'inp': (None, 2), 'scan_id': ()}, 
+        args=([args.spectrum_file])
+    )
+
     test_data = spec_data.map(tf_encode, num_parallel_calls=tf.data.experimental.AUTOTUNE)
     test_data = test_data.filter(filter_max_length)
     test_data = test_data.cache()
@@ -358,6 +382,7 @@ def main(args) :
             mass_int = inp['inp'][i][0][0]
             pepmass.append(float(mass_int.numpy())/RESOLUTION)
         spec = inp['inp']
+        scan_ids = inp['scan_id']
         print("{}/{} Done.".format(Mcount+len(inp['inp']), total), flush = True)
 
 
@@ -382,7 +407,7 @@ def main(args) :
             for i in score[1][idx] :
                 rprob *= i
             with open(args.output_file, 'a') as resultfile :
-                resultfile.write('{}\t{}\t{:.3f}\t{}\t{:.3f}\t{:.6f}\t{}\t{:.3f}\t{:.6f}\n'.format(Mcount, charge_[idx], pepmass[idx], senten, mass, prob, senten_R, mass_R, rprob))
+                resultfile.write('{}\t{}\t{:.3f}\t{}\t{:.3f}\t{:.6f}\t{}\t{:.3f}\t{:.6f}\t{}\n'.format(Mcount, charge_[idx], pepmass[idx], senten, mass, prob, senten_R, mass_R, rprob, scan_ids[idx]))
         print("{}/{} Done.".format(Mcount, total), flush = True)
     print('Procesing {}/{} ... Done. ({:.4f} Sec)'.format(Mcount, total, end), flush = True)
 
